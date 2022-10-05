@@ -1,0 +1,163 @@
+# this spark structured data script gets data from Kafka topic (by Nifi processor),
+# enrich it, and sends it to Postgres DB.
+import os
+from pyparsing import col
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+import pyspark.sql.functions as f
+from pyspark.sql import types as t
+from dateutil.parser import parse
+import pyproj
+
+# generate spark-kafka sync:
+os.environ['PYSPARK_SUBMIT_ARGS'] = '--packages org.apache.spark:spark-sql-kafka-0-10_2.11:2.4.1 pyspark-shell'
+
+bootstrapServers = "Cnt7-naya-cdh63:9092"
+topic = "kafka-bikes"
+
+# create spark session:
+spark = SparkSession\
+        .builder\
+        .appName("Tel-O-Fun")\
+        .config("spark.jars", "/opt/drivers/postgresql-42.3.6.jar") \
+        .getOrCreate()
+        # .config("spark.jars", "/opt/drivers/postgresql-42.3.6.jar") \
+
+# read stream from kafka topic:
+df = spark.readStream \
+    .format("kafka")\
+    .option("kafka.bootstrap.servers", bootstrapServers)\
+    .option("subscribe", topic)\
+    .load()
+    # .option("enable.auto.commit", True)\
+    # .option("startingOffsets", "latest")\
+
+# df.writeStream \
+#    .format("console") \
+#    .start() \
+#    .awaitTermination()
+
+# generate schema:
+schema = t.StructType() \
+    .add("UniqueId", t.StringType(), nullable=False) \
+    .add("station_name", t.StringType()) \
+    .add("free_bikes", t.IntegerType()) \
+    .add("free_bikesE", t.IntegerType()) \
+    .add("free_poll", t.IntegerType()) \
+    .add("free_pollE", t.IntegerType()) \
+    .add("date_import", t.StringType()) \
+    .add("OBJECTID", t.StringType()) \
+    .add("saturday", t.StringType()) \
+    .add("guid", t.StringType()) \
+    .add("x_axis", t.StringType()) \
+    .add("y_axis", t.StringType())
+    # .add("lng", t.StringType()) \
+    # .add("lat", t.StringType())
+
+df = df.drop('OBJECTID', 'saturday', 'guid')
+
+df = df.select(col("value").cast("string"))\
+    .select(from_json(col("value"), schema).alias("value"))\
+    .select("value.*")
+
+# df.writeStream \
+#    .format("console") \
+#    .start() \
+#    .awaitTermination()
+
+# enrichment assists functions:
+def stringToDateTime(num):
+    ''' parse string to timestamp '''
+    if num is not None:
+        return parse(num)
+    else:
+        return None
+
+def get_lat_lng(x, y):
+    ''' calculate coordinates from geometry points '''
+    prj = pyproj.Transformer.from_crs(2039, 4326, always_xy=True)
+    lon, lat = prj.transform(x, y)
+    lst = [lon,lat]
+    return lst
+
+def color_segment(amount):
+    ''' 0 - red, 1 - yellow, 2 - green '''
+    if amount < 3:
+        return 0
+    elif amount >=3 and amount <= 5:
+        return 1
+    else:
+        return 2
+
+# UDF useage:
+dateTimeUdf = udf(stringToDateTime, t.TimestampType())
+hour = f.udf(lambda x: x.hour, t.IntegerType())
+minute = f.udf(lambda x: x.minute, t.IntegerType())
+
+get_loc_udf = udf(get_lat_lng, t.ArrayType(t.DoubleType()))
+
+get_segment_udf = udf(color_segment, t.IntegerType())
+
+# Enrich Dataframe with additional date data
+df = df.withColumn('ts', dateTimeUdf(df.date_import))
+
+# data enrichment:
+df = df \
+    .withColumn("Day", f.dayofmonth(df["ts"])) \
+    .withColumn("Month", f.month(df["ts"]))\
+    .withColumn("Year", f.year(df["ts"]).cast('string'))\
+    .withColumn("date", f.date_format(df["ts"], 'dd/MM/yyyy'))\
+    .withColumn("hour", hour(df["ts"]))\
+    .withColumn("minute", minute(df["ts"])) \
+    .withColumn('lat', get_loc_udf(df['x_axis'], df['y_axis'])[1])\
+    .withColumn('lon', get_loc_udf(df['x_axis'], df['y_axis'])[0])\
+    .withColumn("free_bikes_seg", get_segment_udf(df["free_bikes"])) \
+    .withColumn("free_bikesE_seg", get_segment_udf(df["free_bikesE"])) \
+    .withColumn("free_poll_seg", get_segment_udf(df["free_poll"])) \
+    .withColumn("free_pollE_seg", get_segment_udf(df["free_pollE"]))
+
+# df.writeStream \
+#    .format("console") \
+#    .start() \
+#    .awaitTermination()
+
+# delivering to storage functions (pg, hdfs):
+def _write_streaming_postgres(df, epoch_id):
+    print('DF SIZE IS: ', df.count())
+    df.write \
+        .format("jdbc") \
+        .mode('overwrite') \
+        .option("fetchsize", "100000")\
+        .option("url", f"jdbc:postgresql://postgresql-container:5432/postgres") \
+        .option("driver", "org.postgresql.Driver") \
+        .option("dbtable", 'public.bike_rt') \
+        .option("user", 'postgres') \
+        .option("password", 'NayaPass123!') \
+        .save()
+        # .option("truncate", True) \
+
+def _write_streaming_hdfs(df, epoch_id):
+    df.write \
+        .format("json") \
+        .mode('append') \
+        .option("fetchsize", "100000") \
+        .option("path", "hdfs://Cnt7-naya-cdh63:8020/tmp/fp_stations_data/") \
+        .option("checkpointLocation", "hdfs://Cnt7-naya-cdh63:8020/tmp/fp_stations_data.checkpoint/") \
+        .partitionBy("minute") \
+        .option("truncate", False) \
+        .save()
+
+df.writeStream \
+    .foreachBatch(_write_streaming_postgres) \
+    .outputMode("append") \
+    .start()
+
+df.writeStream \
+    .foreachBatch(_write_streaming_hdfs) \
+    .start() \
+    .awaitTermination()
+
+# df.writeStream \
+#    .format("console") \
+#    .start() \
+#    .awaitTermination()
