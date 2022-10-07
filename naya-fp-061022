@@ -134,11 +134,10 @@ def _write_streaming_postgres(df, epoch_id):
         .option("user", 'postgres') \
         .option("password", 'NayaPass123!') \
         .save()
-        # .option("truncate", True) \
 
 def _write_streaming_hdfs(df, epoch_id):
     df.write \
-        .format("json") \
+        .format("csv") \
         .mode('append') \
         .option("fetchsize", "100000") \
         .option("path", "hdfs://Cnt7-naya-cdh63:8020/tmp/fp_stations_data/") \
@@ -154,6 +153,7 @@ df.writeStream \
 
 df.writeStream \
     .foreachBatch(_write_streaming_hdfs) \
+    .outputMode("append") \
     .start() \
     .awaitTermination()
 
